@@ -40,9 +40,11 @@ Markers live on `den.overlayLib` so they do not collide with den's `den.lib`.
 - `den.overlays.<path>` — module path when the leaf is a function / inject / export
 
 Refer to an extra by its **last path component** as a function argument.
-`final`, `prev`, `lib`, `config`, and the other reserved module args are
-always available; extras that name them are deferred and resolved when
-the overlay is applied.
+`final`, `prev`, and `lib` are reserved overlay args. Extras that name
+them are deferred and resolved when the overlay is applied.
+
+`den.overlays` is not a NixOS module tree: `imports` and `options` are
+rejected at conversion.
 
 `import nixpkgs { overlays = [ outputs.overlays.default ]; }` is a
 fixpoint: `final` is the package set *after* this overlay. Use `prev`
@@ -98,7 +100,7 @@ omitted from `flake.overlays`.
 { denOverlay, ... }:
 {
   den.overlays.nvSources = denOverlay.lib.inject (
-    { final }: final.callPackage ./_sources/generated.nix { }
+    { prev }: prev.callPackage ./_sources/generated.nix { }
   );
 
   den.overlays.TrackersListCollection = { nvSources }: {
@@ -119,13 +121,11 @@ Ancestors become scopes. No `_scope` is required.
 { denOverlay, ... }:
 {
   # overlays/helix/default.nix
-  den.overlays.helix.helix = { runtime, final, prev }:
-    let
-      helix = (inputs.helix.overlays.helix final prev).helix;
-    in
-    helix.overrideAttrs (_: old: {
+  den.overlays.helix.helix = { runtime, final, prev }: {
+    helix = (inputs.helix.overlays.helix final prev).helix.overrideAttrs (_: old: {
       env.HELIX_DEFAULT_RUNTIME = toString runtime;
     });
+  };
 }
 ```
 
@@ -134,14 +134,15 @@ Ancestors become scopes. No `_scope` is required.
 {
   # overlays/helix/runtime.nix  (merges with the file above)
   den.overlays.helix.runtime = denOverlay.lib.inject (
-    { final }: final.runCommand "helix-runtime" { } "mkdir $out"
+    { prev }: prev.runCommand "helix-runtime" { } "mkdir $out"
   );
 }
 ```
 
 Yields `flake.overlays."helix/helix"` only. `runtime` is in scope for
-`helix`. Applied, the overlay wraps a non-attrset result as
-`{ helix = <drv>; }` so nixpkgs still gets an attrset.
+`helix`. Return `{ helix = <drv>; }` yourself; a bare derivation is
+forced at apply time so the converter can wrap it, which re-enters
+the nixpkgs fixpoint.
 
 Different files may assign `helix.helix` and `helix.runtime`; nested
 attrsets merge. Two files must not assign the same leaf.
@@ -282,6 +283,20 @@ does not wait until apply:
 The same happens if you inject under `rime.helpers` and try to take
 `helpers` on a root overlay: `helpers` is not in the root scope.
 
+### No `imports` or `options`
+
+```nix
+{
+  # error at convert
+  den.overlays.foo.imports = [ ./bar.nix ];
+  den.overlays.foo.options = { };
+}
+```
+
+Write overlay functions and attrsets. Split files by assigning
+`den.overlays.helix.helix` and `den.overlays.helix.runtime` separately;
+the tree type merges those paths.
+
 ### Files that only assign overlays
 
 Keep one overlay (or one scope) per file and let import-tree load them.
@@ -290,8 +305,8 @@ Markers come from `denOverlay`, not from den's host library:
 ```nix
 # overlays/pinentry-selector.nix
 {
-  den.overlays.pinentry-selector = { final }: {
-    pinentry-selector = final.writeShellApplication {
+  den.overlays.pinentry-selector = { prev }: {
+    pinentry-selector = prev.writeShellApplication {
       name = "pinentry";
       text = "exec pinentry-tty \"$@\"";
     };
@@ -302,8 +317,8 @@ Markers come from `denOverlay`, not from den's host library:
 ```nix
 # overlays/wshowkeys-mao.nix
 {
-  den.overlays.wshowkeys-mao = { nvSources, final }: {
-    wshowkeys = final.wshowkeys.overrideAttrs {
+  den.overlays.wshowkeys-mao = { nvSources, prev }: {
+    wshowkeys = prev.wshowkeys.overrideAttrs {
       inherit (nvSources.wshowkeys-mao) src;
     };
   };

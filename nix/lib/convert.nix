@@ -1,14 +1,15 @@
-# Convert `den.overlays` module trees into ordinary nixpkgs overlays.
+# Convert `den.overlays` trees into ordinary nixpkgs overlays.
 #
-# Walk each overlay module: collect parameterised functions and scope
-# handlers, bind with nix-effects (`fx.bind.fn` + `fx.handle` +
+# Walk each overlay: collect parameterised functions and scope handlers,
+# bind with nix-effects (`fx.bind.fn` + `fx.handle` +
 # `fx.effects.scope.val`), repeat until no unbound extras remain, then
-# `evalModules` the bound modules. Extra values are never passed as
+# apply the bound functions. Extra values are never passed as
 # specialArgs or module-system args.
 #
-# Resolved extras may name reserved overlay args (`final`, `prev`, `lib`,
-# `config`, …). Those are deferred (den-style) and applied inside
-# evalModules, then substituted into dependents.
+# `imports` and `options` are not allowed in the tree (these are not
+# NixOS modules). Extras that name reserved overlay args (`final`,
+# `prev`, `lib`, `config`, …) are deferred and applied when the overlay
+# runs.
 { lib, fx }:
 let
   mark = import ./mark.nix;
@@ -82,14 +83,7 @@ let
       in
       builtins.any (
         k:
-        if k == "imports" then
-          builtins.any hasWork (lib.toList v.imports)
-        else if k == "options" then
-          false
-        else if k == "config" then
-          hasWork v.config
-        else
-          hasWork v.${k}
+        hasWork v.${k}
       ) keys
     else
       false;
@@ -131,7 +125,8 @@ let
       r;
 
   # Bind extras via nix-effects. Leftover reserved args (or extras that are
-  # themselves deferred) become a den-style thunk applied at evalModules.
+  # themselves deferred) become a den-style thunk applied when the overlay
+  # runs.
   bindComputation =
     {
       parentHandlers,
@@ -229,17 +224,25 @@ let
       progress = leftoverExtras == [ ] && (step.boundCount > 0 || advertised != functionArgsOf fn);
     };
 
-  flattenSameScope =
-    node:
-    if lib.isFunction node then
-      [ node ]
-    else if builtins.isAttrs node && node ? imports then
-      lib.concatMap flattenSameScope (lib.toList node.imports)
-      ++ [
-        (removeAttrs node [ "imports" ])
-      ]
+  rejectModuleKeys =
+    path: node:
+    if mark.isMarked node then
+      rejectModuleKeys path (mark.unwrap node)
+    else if mark.isThunk node || lib.isFunction node || isDerivation node then
+      true
+    else if builtins.isList node then
+      builtins.foldl' (_: v: rejectModuleKeys path v) true node
+    else if isOverlayAttrs node then
+      if node ? imports || node ? options then
+        throw "den.overlays: `imports` and `options` are not supported (overlay trees are not NixOS modules)${
+          if path == [ ] then "" else "; at `${lib.concatStringsSep "." path}`"
+        }"
+      else
+        builtins.foldl' (
+          _: n: rejectModuleKeys (path ++ [ n ]) node.${n}
+        ) true (builtins.attrNames node)
     else
-      [ node ];
+      true;
 
   emptyClass = {
     overlayFns = [ ];
@@ -250,21 +253,7 @@ let
     scopes = { };
   };
 
-  mergeNamed =
-    a: b:
-    a
-    // lib.mapAttrs (
-      name: bVal:
-      if a ? ${name} then
-        {
-          imports = [
-            a.${name}
-            bVal
-          ];
-        }
-      else
-        bVal
-    ) b;
+  mergeNamed = a: b: lib.recursiveUpdate a b;
 
   mergeClass =
     a: b:
@@ -368,11 +357,6 @@ let
             "_scope"
           ]
         );
-        configPart = if attrs ? config then classifyOne attrs.config else emptyClass;
-        rest = removeAttrs attrs [
-          "config"
-          "options"
-        ];
         folded = lib.foldlAttrs (
           acc: name: value:
           if mark.isMarked value then
@@ -410,24 +394,11 @@ let
             // {
               modules = acc.modules ++ [ { ${name} = value; } ];
             }
-        ) emptyClass rest;
+        ) emptyClass attrs;
       in
-      mergeClass folded configPart;
+      folded;
 
-  collect = node: builtins.foldl' mergeClass emptyClass (map classifyOne (flattenSameScope node));
-
-  expandItem =
-    item:
-    if
-      builtins.isAttrs item
-      && !lib.isFunction item
-      && item ? imports
-      && !(item ? config)
-      && !(item ? options)
-    then
-      lib.concatMap expandItem (lib.toList item.imports)
-    else
-      [ item ];
+  collect = classifyOne;
 
   markTree =
     injects: exports:
@@ -435,8 +406,7 @@ let
     // lib.mapAttrs (n: v: mark.export v) exports;
 
   # Several undeclared keys under the same path become several functions
-  # that each return `{ bar.baz.key = … }`. Merge those results instead
-  # of evalModules, which treats nested keys as unique `raw` options.
+  # that each return `{ bar.baz.key = … }`. Merge those results.
   combineFns =
     fns:
     if fns == [ ] then
@@ -476,9 +446,7 @@ let
     let
       scopeItems = lib.mapAttrsToList (name: value: { ${name} = value; }) scopes;
       marked = markTree injects exports;
-      items = lib.concatMap expandItem (
-        modules ++ boundOverlays ++ lib.optional (marked != { }) marked ++ scopeItems
-      );
+      items = modules ++ boundOverlays ++ lib.optional (marked != { }) marked ++ scopeItems;
       fns = builtins.filter lib.isFunction items;
       attrs = builtins.filter (x: builtins.isAttrs x && !lib.isFunction x) items;
       merged = builtins.foldl' lib.recursiveUpdate { } attrs;
@@ -489,12 +457,20 @@ let
     else if attrs == [ ] then
       combined
     else
-      {
-        imports = [
-          combined
-          merged
-        ];
-      };
+      let
+        advertised = functionArgsOf combined;
+        wrapper =
+          { ... }@args:
+          let
+            wanted = functionArgsOf combined;
+            supplied = if wanted == { } then args else lib.intersectAttrs wanted args;
+          in
+          mergeOverlayContents [
+            (combined supplied)
+            merged
+          ];
+      in
+      lib.setFunctionArgs wrapper advertised;
 
   # Inject extras are omitted. Export extras keep their mark: the extra
   # name is scope-only and is stripped when the overlay result is flattened.
@@ -513,15 +489,7 @@ let
         attrs = removeAttrs node (builtins.attrNames reservedKeys);
         kept = lib.filterAttrs (_n: v: !mark.isInject v) attrs;
       in
-      lib.mapAttrs (
-        n: v:
-        if n == "imports" then
-          map finalize (lib.toList v)
-        else if n == "options" then
-          v
-        else
-          finalize v
-      ) kept
+      lib.mapAttrs (_n: finalize) kept
     else
       node;
 
@@ -558,14 +526,6 @@ let
           n: v:
           if n == "_scope" || mark.isInject v then
             { }
-          else if n == "imports" then
-            {
-              imports = map flattenContent (lib.toList v);
-            }
-          else if n == "options" then
-            {
-              inherit (node) options;
-            }
           else if mark.isExport v then
             {
               ${n} = flattenContent v;
@@ -654,61 +614,8 @@ let
 
   bindLoop = node: parentHandlers: bindLoop' parentHandlers node 16;
 
-  overlayFreeform = {
-    freeformType = lib.types.lazyAttrsOf lib.types.raw;
-  };
-
-  # evalModules always supplies lib/config/options/…. Restrict the call
-  # to the function's declared args so `{ final }: …` is a valid module.
-  asModuleFn =
-    fn:
-    let
-      wanted = functionArgsOf fn;
-      wrapper =
-        { ... }@args: fn (if wanted == { } then args else lib.intersectAttrs wanted args);
-    in
-    lib.setFunctionArgs wrapper wanted;
-
-  toEvalModule =
-    node:
-    if lib.isFunction node then
-      asModuleFn node
-    else if builtins.isAttrs node && (node ? imports || node ? config || node ? options) then
-      node
-    else if builtins.isAttrs node then
-      {
-        inherit (overlayFreeform) freeformType;
-        config = node;
-      }
-    else
-      { config = { }; };
-
-  mkEvalArgs =
-    node: extraSpecialArgs:
-    {
-      modules = [
-        overlayFreeform
-        (toEvalModule node)
-      ];
-      specialArgs = extraSpecialArgs;
-    };
-
-  evalOverlayModule =
-    node: extraSpecialArgs:
-    let
-      evalArgs = mkEvalArgs node extraSpecialArgs;
-      evaluated = lib.evalModules evalArgs;
-    in
-    {
-      inherit (evaluated) config;
-      inherit evalArgs;
-      modules = evalArgs.modules;
-    };
-
-  # Materialize an overlay without evalModules. evalModules and a deep
-  # walk both force every attr; under `import nixpkgs { overlays = [ … ]; }`
-  # that is `final` and recurses. Call the function, merge `imports` by
-  # hand, leave package values lazy. Only evalModules when `options` is set.
+  # Call the bound function and unwrap inject/export/thunks. Do not walk
+  # package attrs: that forces `final` in the nixpkgs fixpoint.
   applyOverlay =
     ready: final: prev:
     let
@@ -742,25 +649,6 @@ let
               ) node
             )
           )
-        else if isOverlayAttrs node && node ? imports && !(node ? options) then
-          mergeOverlayContents (
-            map go (lib.toList node.imports ++ lib.optional (node ? config) node.config)
-          )
-        else if isOverlayAttrs node && node ? options then
-          let
-            evaluated = evalOverlayModule node {
-              inherit final prev;
-            };
-            resolvedEval = resolveDeep {
-              inherit
-                final
-                prev
-                lib
-                ;
-              inherit (evaluated) config;
-            } evaluated.config;
-          in
-          finish (flattenContent resolvedEval)
         else
           finish node;
     in
@@ -922,9 +810,10 @@ let
   toOverlays =
     attrs:
     let
+      _reject = rejectModuleKeys [ ] attrs;
       walked = walkOverlays [ ] { } (promoteScopes attrs);
     in
-    builtins.seq walked.force walked.overlays;
+    builtins.seq _reject (builtins.seq walked.force walked.overlays);
 in
 {
   inherit
@@ -932,8 +821,6 @@ in
     bindValue
     bindOverlay
     bindLoop
-    evalOverlayModule
-    mkEvalArgs
     toOverlay
     toOverlayWith
     toOverlays

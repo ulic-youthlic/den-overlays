@@ -79,7 +79,8 @@ in
     type = overlayTree;
     default = { };
     description = ''
-      Attrset of overlay modules. Mark resolved extras with
+      Attrset of overlay trees (not NixOS modules). `imports` and
+      `options` are rejected. Mark resolved extras with
       `den.overlayLib.inject` (scope-only) or `den.overlayLib.export`
       (scope + overlay). Unmarked content is a normal overlay.
 
@@ -114,8 +115,8 @@ in
       Extras on a scope ancestor (or the root) are visible to
       descendants. Out-of-scope extras fail at conversion.
 
-      Extras that name `final`/`prev`/`config` are deferred like den
-      config-thunks and resolved inside evalModules. Binding still
+      Extras that name `final`/`prev`/`lib` are deferred like den
+      config-thunks and resolved when the overlay is applied. Binding
       uses nix-effects, not module-system args.
     '';
   };

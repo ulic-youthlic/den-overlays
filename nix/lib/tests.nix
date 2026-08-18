@@ -167,9 +167,15 @@ let
   leftoverNested = tryOverlays nestedInjectHidden;
 
   leftoverAtApply =
-    # A leftover that slipped to apply would throw here. Conversion must
-    # already have failed, so this is only a sanity check on tryEval.
     leftoverAtToOverlays;
+
+  rejectImports = tryOverlays {
+    foo.imports = [ { bar = 1; } ];
+  };
+
+  rejectOptions = tryOverlays {
+    foo.options = { };
+  };
 
   moduleEval = lib.evalModules {
     specialArgs = { };
@@ -419,6 +425,16 @@ let
         ]
         && result.bar == prevPkgs.hello;
       detail = "attrNames and unused sibling stay lazy";
+    }
+    {
+      name = "imports-rejected-at-toOverlays";
+      ok = !rejectImports.success;
+      detail = rejectImports;
+    }
+    {
+      name = "options-rejected-at-toOverlays";
+      ok = !rejectOptions.success;
+      detail = rejectOptions;
     }
     {
       name = "nixpkgs-style-fixpoint";
