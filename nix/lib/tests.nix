@@ -401,6 +401,41 @@ let
         && lib.hasInfix "import ./mark.nix" testsSrc;
       detail = "imports shipped convert/mark";
     }
+    {
+      name = "apply-does-not-force-overlay-values";
+      ok =
+        let
+          ovs = convert.toOverlays {
+            demo = { prev }: {
+              foo = throw "should stay lazy";
+              bar = prev.hello;
+            };
+          };
+          result = apply ovs.demo;
+        in
+        namesOf result == [
+          "bar"
+          "foo"
+        ]
+        && result.bar == prevPkgs.hello;
+      detail = "attrNames and unused sibling stay lazy";
+    }
+    {
+      name = "nixpkgs-style-fixpoint";
+      ok =
+        let
+          ovs = convert.toOverlays {
+            demo = { final, prev }: {
+              hello = prev.hello;
+              greet = final.hello + "-greet";
+            };
+          };
+          prev = prevPkgs;
+          self = prev // ovs.demo self prev;
+        in
+        self.hello == prevPkgs.hello && self.greet == prevPkgs.hello + "-greet";
+      detail = "final.hello is the overlay's own hello, lazily";
+    }
   ];
 
   failed = builtins.filter (a: !a.ok) assertions;

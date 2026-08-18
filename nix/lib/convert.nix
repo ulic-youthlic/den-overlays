@@ -96,6 +96,11 @@ let
 
   handlersFrom = attrs: fx.effects.scope.handlersFromAttrs attrs;
 
+  isDerivation = v: builtins.isAttrs v && !lib.isFunction v && (v.type or null) == "derivation";
+
+  isOverlayAttrs =
+    v: builtins.isAttrs v && !lib.isFunction v && !mark.isMarked v && !mark.isThunk v && !isDerivation v;
+
   resolveThunk =
     modArgs: v:
     if mark.isThunk v then
@@ -112,7 +117,11 @@ let
     let
       r = resolveThunk modArgs v;
     in
-    if builtins.isList r then
+    if isDerivation r then
+      # Do not walk drv attrs (outPath, …); that forces the build in the
+      # nixpkgs overlay fixpoint.
+      r
+    else if builtins.isList r then
       map (resolveDeep modArgs) r
     else if mark.isMarked r then
       mark.remake r (resolveDeep modArgs r.value)
@@ -203,7 +212,9 @@ let
           resolvedExtras = lib.mapAttrs (_: resolveThunk modArgs) step.extraVals;
           reserved = lib.intersectAttrs step.remaining (modArgs // { inherit lib; });
         in
-        resolveDeep modArgs (fn (resolvedExtras // reserved));
+        # Do not resolveDeep the overlay result: walking package attrs
+        # forces `final` / derivations in the nixpkgs fixpoint.
+        fn (resolvedExtras // reserved);
       value =
         if leftoverExtras != [ ] then
           fn
@@ -485,11 +496,6 @@ let
         ];
       };
 
-  isDerivation = v: builtins.isAttrs v && !lib.isFunction v && (v.type or null) == "derivation";
-
-  isOverlayAttrs =
-    v: builtins.isAttrs v && !lib.isFunction v && !mark.isMarked v && !mark.isThunk v && !isDerivation v;
-
   # Inject extras are omitted. Export extras keep their mark: the extra
   # name is scope-only and is stripped when the overlay result is flattened.
   finalize =
@@ -699,49 +705,66 @@ let
       modules = evalArgs.modules;
     };
 
+  # Materialize an overlay without evalModules. evalModules and a deep
+  # walk both force every attr; under `import nixpkgs { overlays = [ … ]; }`
+  # that is `final` and recurses. Call the function, merge `imports` by
+  # hand, leave package values lazy. Only evalModules when `options` is set.
   applyOverlay =
     ready: final: prev:
     let
       callArgs = dummyModuleArgs // {
         inherit final prev;
       };
-      called =
-        if lib.isFunction ready then
+
+      callFn =
+        fn:
+        let
+          args = functionArgsOf fn;
+          supplied = if args == { } then callArgs else lib.intersectAttrs args callArgs;
+        in
+        fn supplied;
+
+      finish =
+        content: if isOverlayAttrs content then removeAttrs content [ "_module" ] else content;
+
+      go =
+        node:
+        if lib.isFunction node then
+          go (callFn node)
+        else if mark.isMarked node || mark.isThunk node then
+          finish (
+            flattenContent (
+              resolveDeep (
+                callArgs
+                // {
+                  config = { };
+                }
+              ) node
+            )
+          )
+        else if isOverlayAttrs node && node ? imports && !(node ? options) then
+          mergeOverlayContents (
+            map go (lib.toList node.imports ++ lib.optional (node ? config) node.config)
+          )
+        else if isOverlayAttrs node && node ? options then
           let
-            args = functionArgsOf ready;
-            supplied = if args == { } then callArgs else lib.intersectAttrs args callArgs;
+            evaluated = evalOverlayModule node {
+              inherit final prev;
+            };
+            resolvedEval = resolveDeep {
+              inherit
+                final
+                prev
+                lib
+                ;
+              inherit (evaluated) config;
+            } evaluated.config;
           in
-          ready supplied
+          finish (flattenContent resolvedEval)
         else
-          ready;
-      resolvedCall = resolveDeep (
-        callArgs
-        // {
-          config = { };
-        }
-      ) called;
+          finish node;
     in
-    if isOverlayAttrs resolvedCall then
-      let
-        evaluated = evalOverlayModule ready {
-          inherit final prev;
-        };
-        resolved = resolveDeep {
-          inherit
-            final
-            prev
-            lib
-            ;
-          inherit (evaluated) config;
-        } evaluated.config;
-        content = flattenContent resolved;
-      in
-      if isOverlayAttrs content then
-        removeAttrs content [ "_module" ]
-      else
-        content
-    else
-      flattenContent resolvedCall;
+    go ready;
 
   toOverlayWith =
     parentHandlers: module:

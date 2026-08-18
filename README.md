@@ -44,9 +44,19 @@ Refer to an extra by its **last path component** as a function argument.
 always available; extras that name them are deferred and resolved when
 the overlay is applied.
 
-Apply an exported overlay as `overlay pkgs pkgs` (or `overlay final prev`).
-Do not use `pkgs.extend` / `appendOverlays` if you only want the overlay's
-return value: that re-enters nixpkgs and can recurse through `final`.
+`import nixpkgs { overlays = [ outputs.overlays.default ]; }` is a
+fixpoint: `final` is the package set *after* this overlay. Use `prev`
+for packages that already exist (`override`, `callPackage`,
+`writeShellApplication`). Use `final` only to name attrs this overlay
+(or an earlier one) adds, and only lazily — do not force
+`final.<name>` for a name you are defining in the same step.
+
+Return an **attrset** of packages (`{ helix = …; }`). A function that
+returns a bare derivation is forced at apply time so the converter can
+wrap it as `{ <leaf> = drv; }`, which re-enters the fixpoint.
+
+To inspect one overlay's return value without the fixpoint, call
+`overlay pkgs pkgs`.
 
 ## Examples
 

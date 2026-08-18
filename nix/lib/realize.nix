@@ -84,11 +84,10 @@ let
           }
       ) { derivations = { }; other = { }; } result;
 
-  # Use the same pkgs for `final` and `prev`. `pkgs.extend overlay` would
-  # put this overlay's result into `final` while convert still
-  # `evalModules`s with that `final`, which loops. Overlay bodies that
-  # only call `final.callPackage` / `final.writeShellApplication` (or
-  # `prev.foo.overrideAttrs`) work with unextended pkgs.
+  # Use the same pkgs for `final` and `prev` so this helper only sees
+  # the overlay *return value*, not a nixpkgs fixpoint. Overlay apply
+  # itself is lazy: `import nixpkgs { overlays = [ ov ]; }` is the
+  # supported way to get a full package set.
   applyOverlay =
     pkgs: overlay:
     let
